@@ -1,0 +1,78 @@
+# Curated ManiSkill paired success/failure trajectories.
+common:
+  num_latent_frames: 7
+  video_height: 384
+  video_width: 320
+  state_dim: 9
+
+dataset:
+  tasks:
+    - task_id: "maniskill_pick_cube"
+      t5_embedding_path: "data/t5_embedding/maniskill/PickCube-v1/pick_cube.pt"
+      data_paths:
+        - "/mnt/nas/linyumin/datasets/maniskill_viva_100/viva_v2_curated/success/PickCube-v1"
+        - "/mnt/nas/linyumin/datasets/maniskill_viva_100/viva_v2_curated/failure/PickCube-v1"
+    - task_id: "maniskill_stack_cube"
+      t5_embedding_path: "data/t5_embedding/maniskill/StackCube-v1/stack_cube.pt"
+      data_paths:
+        - "/mnt/nas/linyumin/datasets/maniskill_viva_100/viva_v2_curated/success/StackCube-v1"
+        - "/mnt/nas/linyumin/datasets/maniskill_viva_100/viva_v2_curated/failure/StackCube-v1"
+  compute_state_stats: true
+  future_offset: 30
+  max_samples: null
+  state:
+    mode: auto
+    image_keys:
+      cam_high:
+        - observation.images.base_camera
+      cam_left_wrist:
+        - observation.images.unused_left_camera
+      cam_right_wrist:
+        - observation.images.hand_camera
+  value_target:
+    mode: outcome_event_progress
+    success_only: false
+    failure_event_key: sim.fail
+
+model:
+  wan:
+    config_path: "weights/Wan2.2-TI2V-5B"
+    checkpoint_path: "weights/Wan2.2-TI2V-5B"
+    vae_path: "weights/Wan2.2-TI2V-5B/Wan2.2_VAE.pth"
+    precision: "bfloat16"
+    num_layers: 30
+
+training:
+  batch_size: 2
+  max_steps: 5000
+  max_epochs: null
+  learning_rate: 4.0e-5
+  wan_learning_rate: 4.0e-5
+  weight_decay: 0.01
+  gradient_accumulation_steps: 1
+  loss_weight_future_state: 0.5
+  loss_weight_value: 1.0
+  scheduler_type: "linear"
+  warmup_steps: 500
+  cycle_length: 100000
+  f_max: 1.0
+  f_min: 0.1
+  grad_clip_norm: 1.0
+  use_amp: true
+
+system:
+  checkpoint_dir: "./checkpoints/maniskill_outcome_event_state9"
+  log_level: "INFO"
+  log_interval: 50
+  save_interval: 2500
+  num_workers: 4
+  pin_memory: true
+
+logging:
+  report_to: "tensorboard"
+  tensorboard_log_dir: "./tensorboard"
+  run_name: "maniskill_outcome_event_state9"
+
+resume:
+  checkpoint_path: null
+  reset_step: false

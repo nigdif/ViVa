@@ -5,15 +5,69 @@
 
 import os
 import bisect
+import json
 import torch
 import numpy as np
 from torch.utils.data import Dataset
 from PIL import Image
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 import logging
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_IMAGE_KEYS = {
+    'cam_high': ['observation.images.cam_high'],
+    'cam_left_wrist': ['observation.images.cam_left_wrist'],
+    'cam_right_wrist': ['observation.images.cam_right_wrist'],
+}
+
+SUPPORTED_VALUE_TARGET_MODES = {
+    'remaining_progress',
+    'outcome_event_progress',
+}
+
+
+def _cfg_to_dict(config: Optional[Any]) -> Dict[str, Any]:
+    if config is None:
+        return {}
+    if isinstance(config, dict):
+        return dict(config)
+    return {key: getattr(config, key) for key in config.keys()}
+
+
+def select_state_vector(
+    sample: Dict[str, Any],
+    *,
+    state_mode: str,
+    state_dim: int,
+    state_key: Optional[str] = None,
+    state_indices: Optional[List[int]] = None,
+) -> torch.Tensor:
+    if state_mode not in ('auto', 'first_n', 'custom_map'):
+        raise ValueError(f"Unsupported state mode: {state_mode}")
+    source_key = state_key or 'observation.state'
+    state_raw = sample.get(source_key)
+    if state_raw is None:
+        raise KeyError(f"Sample is missing state key {source_key!r}")
+    state = (
+        state_raw.float().flatten()
+        if isinstance(state_raw, torch.Tensor)
+        else torch.tensor(state_raw, dtype=torch.float32).flatten()
+    )
+    indices = state_indices
+    if indices is None and state_mode != 'custom_map':
+        indices = list(range(state_dim))
+    if indices is not None:
+        if max(indices, default=-1) >= state.numel():
+            raise ValueError(
+                f"State {source_key!r} has {state.numel()} dims but needs {indices}")
+        state = state[torch.tensor(indices, dtype=torch.long)]
+    if state.numel() != state_dim:
+        raise ValueError(
+            f"State mode {state_mode!r} produced {state.numel()} dims, "
+            f"expected {state_dim}")
+    return state
 
 
 class VivaDataset(Dataset):
@@ -32,11 +86,41 @@ class VivaDataset(Dataset):
         max_samples: Optional[int] = None,
         future_offset: int = 75,
         task_configs: Optional[List[Dict]] = None,
+        state_dim: int = 14,
+        value_target_config: Optional[Dict] = None,
+        state_config: Optional[Dict] = None,
     ):
         self.video_height = video_height
         self.video_width = video_width
         self.max_samples = max_samples
         self.future_offset = future_offset
+        self.state_dim = int(state_dim)
+        self.value_target_config = _cfg_to_dict(value_target_config)
+        self.value_target_mode = self.value_target_config.get(
+            'mode', 'remaining_progress')
+        self.success_only = bool(
+            self.value_target_config.get('success_only', False))
+        if self.value_target_mode not in SUPPORTED_VALUE_TARGET_MODES:
+            raise ValueError(
+                f"Unsupported value target mode: {self.value_target_mode}. "
+                f"Expected one of {sorted(SUPPORTED_VALUE_TARGET_MODES)}")
+        if self.success_only and self.value_target_mode != 'remaining_progress':
+            raise ValueError(
+                "success_only is intended for remaining_progress training")
+        self.failure_event_key = self.value_target_config.get(
+            'failure_event_key', 'sim.fail')
+
+        self.state_config = _cfg_to_dict(state_config)
+        self.state_mode = self.state_config.get('mode', 'auto')
+        self.state_key = self.state_config.get('source_key')
+        indices = self.state_config.get('indices')
+        self.state_indices = (
+            [int(index) for index in indices] if indices is not None else None)
+        self.image_keys = {
+            name: list(self.state_config.get('image_keys', {}).get(
+                name, defaults))
+            for name, defaults in DEFAULT_IMAGE_KEYS.items()
+        }
 
         self._subdataset_to_task_id = None
         self.task_configs = task_configs
@@ -56,13 +140,14 @@ class VivaDataset(Dataset):
         else:
             if data_paths is None:
                 raise ValueError("Either data_paths or task_configs must be provided")
+        self.data_paths = [Path(path) for path in data_paths]
 
         if state_stats is not None:
             self.state_min = torch.tensor(state_stats['state_min'], dtype=torch.float32)
             self.state_max = torch.tensor(state_stats['state_max'], dtype=torch.float32)
         else:
-            self.state_min = torch.tensor([-3.0] * 14, dtype=torch.float32)
-            self.state_max = torch.tensor([3.0] * 14, dtype=torch.float32)
+            self.state_min = torch.tensor([-3.0] * self.state_dim, dtype=torch.float32)
+            self.state_max = torch.tensor([3.0] * self.state_dim, dtype=torch.float32)
 
         from giga_datasets.datasets.dataset import load_dataset
 
@@ -91,8 +176,9 @@ class VivaDataset(Dataset):
             self.lerobot_dataset.cumulative_sizes = cumsum
 
         self._subdataset_episode_lengths = []
+        self._subdataset_episode_success = []
         max_episode_length = 0
-        for dataset in self.lerobot_dataset.datasets:
+        for sub_ds_idx, dataset in enumerate(self.lerobot_dataset.datasets):
             sub_lengths = []
             meta = dataset.dataset.meta
             total_episodes = meta.info["total_episodes"]
@@ -101,22 +187,65 @@ class VivaDataset(Dataset):
                 sub_lengths.append(length)
                 max_episode_length = max(max_episode_length, length)
             self._subdataset_episode_lengths.append(sub_lengths)
+            labels_path = (
+                self.data_paths[sub_ds_idx] / 'meta' / 'episode_success.jsonl')
+            labels = {}
+            if labels_path.exists():
+                with open(labels_path) as handle:
+                    for line in handle:
+                        row = json.loads(line)
+                        labels[int(row['episode_index'])] = bool(row['success'])
+            self._subdataset_episode_success.append(labels)
 
         self.max_episode_length = max_episode_length
+        if self.value_target_mode == 'outcome_event_progress':
+            for sub_ds_idx, lengths in enumerate(
+                    self._subdataset_episode_lengths):
+                labels = self._subdataset_episode_success[sub_ds_idx]
+                missing = [
+                    episode_idx for episode_idx in range(len(lengths))
+                    if episode_idx not in labels
+                ]
+                if missing:
+                    raise ValueError(
+                        "outcome_event_progress requires an episode_success "
+                        f"label for every episode in {self.data_paths[sub_ds_idx]}; "
+                        f"missing {len(missing)} labels")
         logger.info(f"  Max episode length: {max_episode_length}")
         logger.info(f"  Video size: {video_height}x{video_width}")
         logger.info(f"  State range: [{self.state_min.min():.2f}, {self.state_max.max():.2f}]")
 
         self._total_samples = len(self.lerobot_dataset)
-        self._sample_indices = None
+        candidate_indices = np.arange(self._total_samples, dtype=np.int64)
+        if self.success_only:
+            kept = []
+            sub_offset = 0
+            for sub_idx, lengths in enumerate(self._subdataset_episode_lengths):
+                frame_offset = sub_offset
+                labels = self._subdataset_episode_success[sub_idx]
+                if len(labels) < len(lengths):
+                    raise ValueError(
+                        f"success_only requires labels for every episode in "
+                        f"{self.data_paths[sub_idx]}")
+                for episode_idx, length in enumerate(lengths):
+                    if labels[episode_idx]:
+                        kept.extend(range(frame_offset, frame_offset + length))
+                    frame_offset += length
+                sub_offset += sum(lengths)
+            candidate_indices = np.asarray(kept, dtype=np.int64)
+            logger.info(
+                f"  success_only: kept {len(candidate_indices)} frames")
+
+        self._sample_indices = candidate_indices
         if self.max_samples is not None and self.max_samples > 0:
-            self._effective_length = min(self.max_samples, self._total_samples)
-            if self._effective_length < self._total_samples:
+            self._effective_length = min(
+                self.max_samples, len(candidate_indices))
+            if self._effective_length < len(candidate_indices):
                 rng = np.random.RandomState(42)
                 self._sample_indices = rng.choice(
-                    self._total_samples, size=self._effective_length, replace=False)
+                    candidate_indices, size=self._effective_length, replace=False)
         else:
-            self._effective_length = self._total_samples
+            self._effective_length = len(candidate_indices)
 
     def _get_subdataset_index(self, global_idx: int) -> int:
         return bisect.bisect_right(self.lerobot_dataset.cumulative_sizes, global_idx)
@@ -150,10 +279,40 @@ class VivaDataset(Dataset):
                               pad_h // 2, pad_h - pad_h // 2), value=0)
         return image
 
-    def _compute_value(self, frame_idx: int, episode_length: int) -> float:
+    @staticmethod
+    def _to_bool_scalar(value: Any) -> bool:
+        if isinstance(value, torch.Tensor):
+            if value.numel() != 1:
+                raise ValueError(
+                    f"Expected a scalar failure flag, got shape {value.shape}")
+            return bool(value.item())
+        array = np.asarray(value)
+        if array.size != 1:
+            raise ValueError(
+                f"Expected a scalar failure flag, got shape {array.shape}")
+        return bool(array.reshape(-1)[0])
+
+    def _compute_value(
+        self,
+        frame_idx: int,
+        episode_length: int,
+        *,
+        success: Optional[bool] = None,
+        failure_started: bool = False,
+    ) -> float:
         if episode_length <= 1:
-            return 0.5
-        return (episode_length - frame_idx - 1) / (episode_length - 1)
+            progress = 1.0
+        else:
+            progress = frame_idx / (episode_length - 1)
+
+        if self.value_target_mode == 'remaining_progress':
+            return 1.0 - progress
+        if success is None:
+            raise ValueError(
+                "outcome_event_progress requires an episode success label")
+        if success or not failure_started:
+            return progress
+        return -progress
 
     def _normalize_state(self, state: torch.Tensor) -> torch.Tensor:
         state = torch.clamp(state, self.state_min, self.state_max)
@@ -161,12 +320,22 @@ class VivaDataset(Dataset):
         return state_normalized * 2 - 1
 
     def _load_state(self, sample) -> torch.Tensor:
-        state_raw = sample.get('observation.state', None)
-        if state_raw is not None:
-            if isinstance(state_raw, torch.Tensor):
-                return self._normalize_state(state_raw.float())
-            return self._normalize_state(torch.tensor(state_raw, dtype=torch.float32))
-        return torch.zeros(14)
+        state = select_state_vector(
+            sample,
+            state_mode=self.state_mode,
+            state_dim=self.state_dim,
+            state_key=self.state_key,
+            state_indices=self.state_indices,
+        )
+        return self._normalize_state(state)
+
+    @staticmethod
+    def _get_first_available(sample, keys: List[str]):
+        for key in keys:
+            value = sample.get(key)
+            if value is not None:
+                return value
+        return None
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         try:
@@ -183,9 +352,12 @@ class VivaDataset(Dataset):
 
             state_normalized = self._load_state(sample)
 
-            cam_high_raw = sample.get('observation.images.cam_high', None)
-            cam_left_raw = sample.get('observation.images.cam_left_wrist', None)
-            cam_right_raw = sample.get('observation.images.cam_right_wrist', None)
+            cam_high_raw = self._get_first_available(
+                sample, self.image_keys['cam_high'])
+            cam_left_raw = self._get_first_available(
+                sample, self.image_keys['cam_left_wrist'])
+            cam_right_raw = self._get_first_available(
+                sample, self.image_keys['cam_right_wrist'])
 
             cam_high = self._process_image(cam_high_raw) if cam_high_raw is not None else torch.zeros(3, self.video_height, self.video_width)
             cam_left_wrist = self._process_image(cam_left_raw) if cam_left_raw is not None else torch.zeros(3, self.video_height, self.video_width)
@@ -201,8 +373,27 @@ class VivaDataset(Dataset):
             else:
                 future_state_normalized = state_normalized.clone()
 
-            value = self._compute_value(frame_index, episode_length)
-            value_normalized = value * 2 - 1
+            episode_success = self._subdataset_episode_success[
+                sub_ds_idx].get(episode_index)
+            failure_started = False
+            if not episode_success and self.value_target_mode == 'outcome_event_progress':
+                failure_flag = sample.get(self.failure_event_key)
+                if failure_flag is None:
+                    raise KeyError(
+                        f"Sample is missing failure event key "
+                        f"{self.failure_event_key!r}")
+                failure_started = self._to_bool_scalar(failure_flag)
+
+            value = self._compute_value(
+                frame_index,
+                episode_length,
+                success=episode_success,
+                failure_started=failure_started,
+            )
+            value_normalized = (
+                value if self.value_target_mode == 'outcome_event_progress'
+                else value * 2 - 1
+            )
             task_id = self._subdataset_to_task_id[sub_ds_idx] if self._subdataset_to_task_id else 0
 
             return {
@@ -213,6 +404,9 @@ class VivaDataset(Dataset):
                 'future_state': future_state_normalized,
                 'value': torch.tensor(value, dtype=torch.float32),
                 'value_normalized': torch.tensor(value_normalized, dtype=torch.float32),
+                'success': torch.tensor(
+                    int(episode_success) if episode_success is not None else -1,
+                    dtype=torch.int64),
                 'frame_idx': frame_index,
                 'episode_length': episode_length,
                 'future_frame_idx': future_frame_idx,
@@ -220,13 +414,17 @@ class VivaDataset(Dataset):
             }
 
         except Exception as e:
+            if self.value_target_mode == 'outcome_event_progress':
+                raise RuntimeError(
+                    f"Failed to load outcome training sample idx={idx}") from e
             logger.warning(f"Error loading sample idx={idx}: {e}")
             dummy_img = torch.zeros(3, self.video_height, self.video_width)
             return {
                 'cam_high': dummy_img.clone(), 'cam_left_wrist': dummy_img.clone(),
-                'cam_right_wrist': dummy_img.clone(), 'state': torch.zeros(14),
-                'future_state': torch.zeros(14),
+                'cam_right_wrist': dummy_img.clone(), 'state': torch.zeros(self.state_dim),
+                'future_state': torch.zeros(self.state_dim),
                 'value': torch.tensor(0.5), 'value_normalized': torch.tensor(0.0),
+                'success': torch.tensor(-1, dtype=torch.int64),
                 'frame_idx': 0, 'episode_length': 1, 'future_frame_idx': 0, 'task_id': 0,
             }
 
@@ -243,6 +441,7 @@ def viva_collate_fn(batch):
         'future_state': torch.stack([b['future_state'] for b in batch]),
         'value': torch.stack([b['value'] for b in batch]),
         'value_normalized': torch.stack([b['value_normalized'] for b in batch]),
+        'success': torch.stack([b['success'] for b in batch]),
         'frame_idx': torch.tensor([b['frame_idx'] for b in batch]),
         'episode_length': torch.tensor([b['episode_length'] for b in batch]),
         'future_frame_idx': torch.tensor([b['future_frame_idx'] for b in batch]),
@@ -250,9 +449,21 @@ def viva_collate_fn(batch):
     }
 
 
-def compute_dataset_state_stats(data_paths):
+def compute_dataset_state_stats(
+    data_paths,
+    state_dim: int = 14,
+    state_config: Optional[Dict] = None,
+    success_only: bool = False,
+):
     """Compute state min/max statistics across all datasets."""
     from giga_datasets.datasets.dataset import load_dataset
+
+    state_config = _cfg_to_dict(state_config)
+    state_mode = state_config.get('mode', 'auto')
+    state_key = state_config.get('source_key')
+    indices = state_config.get('indices')
+    state_indices = (
+        [int(index) for index in indices] if indices is not None else None)
 
     configs = [{"_class_name": "LeRobotDataset", "data_path": str(p),
                 "skip_video_decoding": True} for p in data_paths]
@@ -261,15 +472,23 @@ def compute_dataset_state_stats(data_paths):
     all_states = []
     for i in range(len(dataset)):
         sample = dataset[i]
-        state = sample.get('observation.state', None)
-        if state is not None:
-            if isinstance(state, torch.Tensor):
-                all_states.append(state.float().numpy())
-            else:
-                all_states.append(np.array(state, dtype=np.float32))
+        try:
+            state = select_state_vector(
+                sample,
+                state_mode=state_mode,
+                state_dim=state_dim,
+                state_key=state_key,
+                state_indices=state_indices,
+            )
+            all_states.append(state.numpy())
+        except (KeyError, ValueError):
+            continue
 
     if not all_states:
-        return {'state_min': [-3.0] * 14, 'state_max': [3.0] * 14}
+        return {
+            'state_min': [-3.0] * state_dim,
+            'state_max': [3.0] * state_dim,
+        }
 
     all_states = np.stack(all_states, axis=0)
     return {

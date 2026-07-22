@@ -47,6 +47,9 @@ class VivaModel(nn.Module):
         self.latent_h = config.common.video_height // 16
         self.latent_w = config.common.video_width // 16
         self.latent_c = 48
+        self.state_dim = int(getattr(config.common, 'state_dim', 14))
+        value_target_cfg = getattr(getattr(config, 'dataset', object()), 'value_target', {})
+        self.value_target_mode = value_target_cfg.get('mode', 'remaining_progress')
 
         self.loss_weight_future_state = getattr(
             config.training, 'loss_weight_future_state', 1.0)
@@ -59,6 +62,8 @@ class VivaModel(nn.Module):
                      f"{self.latent_h}, {self.latent_w}]")
         logger.info(f"  Loss weights: fut_state={self.loss_weight_future_state}"
                      f", value={self.loss_weight_value}")
+        logger.info(f"  State dim: {self.state_dim}")
+        logger.info(f"  Value target mode: {self.value_target_mode}")
 
         self.fm_scheduler = FlowMatchScheduler(
             shift=5.0, sigma_min=0.0,
@@ -282,8 +287,10 @@ class VivaModel(nn.Module):
         Predict future state + value via iterative denoising.
 
         Returns:
-          'value': [B] in [0, 1]
-          'future_state': [B, 14]  (predicted future state, denormalized to [-1, 1])
+          'value': [B] value in the training target range
+          'value_raw': [B] latent value clipped to [-1, 1]
+          'value_score': [B] value_raw mapped to [0, 1]
+          'future_state': [B, state_dim]  (predicted future state, normalized to [-1, 1])
         """
         B = state.shape[0]
         device = state.device
@@ -311,11 +318,23 @@ class VivaModel(nn.Module):
                     pred[:, :, idx], t, latent[:, :, idx])
 
         value_norm = extract_value_from_latent(latent)
-        value = torch.clamp((value_norm + 1) / 2, 0, 1)
+        value_raw = torch.clamp(value_norm, -1, 1)
+        value_score = torch.clamp((value_raw + 1) / 2, 0, 1)
+        if self.value_target_mode in {
+            'outcome_progress',
+            'outcome_separated_progress',
+            'outcome_late_failure',
+            'outcome_event_progress',
+        }:
+            value = value_raw
+        else:
+            value = value_score
         predicted_future_state = extract_state_from_latent(
-            latent, state_dim=14, state_index=FUTURE_STATE_IDX)
+            latent, state_dim=self.state_dim, state_index=FUTURE_STATE_IDX)
 
         return {
             'value': value,
+            'value_raw': value_raw,
+            'value_score': value_score,
             'future_state': predicted_future_state,
         }

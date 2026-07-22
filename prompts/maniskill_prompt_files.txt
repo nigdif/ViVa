@@ -1,0 +1,2 @@
+/mnt/nas/linyumin/projects/ViVa_mode/prompts/maniskill/PickCube-v1/pick_cube.txt
+/mnt/nas/linyumin/projects/ViVa_mode/prompts/maniskill/StackCube-v1/stack_cube.txt

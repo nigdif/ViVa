@@ -387,8 +387,19 @@ def create_dataloaders(config, rank, world_size):
 
     logger.info("Computing state statistics...")
     state_stats = None
+    state_dim = int(getattr(config.common, 'state_dim', 14))
+    state_config = getattr(config.dataset, 'state', None)
+    value_target_config = getattr(config.dataset, 'value_target', None)
+    success_only = bool(
+        value_target_config.get('success_only', False)
+        if value_target_config is not None else False)
     if hasattr(config.dataset, 'compute_state_stats') and config.dataset.compute_state_stats:
-        state_stats = compute_dataset_state_stats(data_paths)
+        state_stats = compute_dataset_state_stats(
+            data_paths,
+            state_dim=state_dim,
+            state_config=state_config,
+            success_only=success_only,
+        )
         logger.info(f"State min: {state_stats['state_min']}")
         logger.info(f"State max: {state_stats['state_max']}")
 
@@ -403,6 +414,9 @@ def create_dataloaders(config, rank, world_size):
             max_samples=max_samples,
             future_offset=future_offset,
             task_configs=task_configs,
+            state_dim=state_dim,
+            value_target_config=value_target_config,
+            state_config=state_config,
         )
     else:
         train_dataset = VivaDataset(
@@ -412,6 +426,9 @@ def create_dataloaders(config, rank, world_size):
             state_stats=state_stats,
             max_samples=max_samples,
             future_offset=future_offset,
+            state_dim=state_dim,
+            value_target_config=value_target_config,
+            state_config=state_config,
         )
 
     logger.info(f"Viva dataset size: {len(train_dataset)}, future_offset: {future_offset}")

@@ -1,0 +1,92 @@
+# Basket place, symmetric delayed-outcome with 50/50 success/failure sampling.
+#   both outcomes: 0.0 before failure_warmup
+#   success: 0.0 -> 1.0 after failure_warmup
+#   failure: 0.0 -> -1.0 after failure_warmup
+
+common:
+  num_latent_frames: 7
+  video_height: 384
+  video_width: 320
+  state_dim: 26
+
+dataset:
+  tasks:
+    - task_id: "basket_place"
+      t5_embedding_path: "data/t5_embedding/basket_place.pt"
+      data_paths:
+        - "data/adapted/lerobot_v3/basket_place_a02_03_s_76_f_28_sf_state26"
+        - "data/adapted/lerobot_v3/basket_place_a02_04_train80_s_93_f_19_sf_state26"
+  compute_state_stats: true
+  future_offset: 50
+  max_samples: null
+  sampling:
+    outcome_balanced: true
+    replacement: true
+    seed: 42
+  state:
+    mode: auto
+    image_keys:
+      cam_high:
+        - observation.images.cam_high
+        - observation.images.top_head
+      cam_left_wrist:
+        - observation.images.cam_left_wrist
+        - observation.images.hand_left
+      cam_right_wrist:
+        - observation.images.cam_right_wrist
+        - observation.images.hand_right
+  value_target:
+    mode: outcome_late_failure
+    failure_warmup: 0.5
+    failure_end_value: -1.0
+    success_end_value: 1.0
+    success_label_keys:
+      - success
+      - is_success
+      - episode_success
+      - task_success
+      - done_success
+    default_success: null
+
+model:
+  wan:
+    config_path: "weights/Wan2.2-TI2V-5B"
+    checkpoint_path: "weights/Wan2.2-TI2V-5B"
+    vae_path: "weights/Wan2.2-TI2V-5B/Wan2.2_VAE.pth"
+    precision: "bfloat16"
+    num_layers: 30
+
+training:
+  batch_size: 2
+  max_steps: null
+  max_epochs: 1
+  learning_rate: 4.0e-5
+  wan_learning_rate: 4.0e-5
+  weight_decay: 0.01
+  gradient_accumulation_steps: 1
+  loss_weight_future_state: 0.5
+  loss_weight_value: 1.0
+  scheduler_type: "linear"
+  warmup_steps: 500
+  cycle_length: 100000
+  f_max: 1.0
+  f_min: 0.1
+  grad_clip_norm: 1.0
+  use_amp: true
+
+system:
+  checkpoint_dir: "./checkpoints/basket_place_outcome_late_failure_balanced_state26"
+  log_level: "INFO"
+  log_interval: 50
+  save_interval: 2500
+  num_workers: 4
+  pin_memory: true
+
+logging:
+  report_to: "tensorboard"
+  tensorboard_log_dir: "./tensorboard"
+  run_name: "basket_place_outcome_late_failure_balanced_state26"
+
+resume:
+  checkpoint_path: null
+  reset_step: false

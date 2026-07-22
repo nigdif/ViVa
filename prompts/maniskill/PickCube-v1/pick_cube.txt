@@ -1,0 +1,1 @@
+A Panda robot picks up a cube and moves it to the target position.

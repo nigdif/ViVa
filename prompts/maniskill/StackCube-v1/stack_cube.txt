@@ -1,0 +1,1 @@
+A Panda robot picks up one cube and stacks it on top of another cube.
